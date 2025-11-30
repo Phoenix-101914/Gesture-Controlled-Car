@@ -194,19 +194,68 @@ int main(void){
     while(!(ADC1->SR & (1<<1)));
 		adc_result1 = ADC1->DR;
 		
-		if(adc_result1 > BENT_Threshold && last_cmd != '0'){
+		if(adc_result1 > BENT_Threshold && accel_x < -9.8 + Threshold && accel_x > -9.8 - Threshold && last_cmd != '0'){ //Stop
 			UART_Send("AT+CIPSEND=1\r\n");
 			DELAY_Ms(100);
 			UART_Send("0");
 			UART_Send("\r\n");
 			last_cmd = '0';
 		}
-		else if(adc_result1 < BENT_Threshold && last_cmd != '1'){
+		else if(adc_result1 < BENT_Threshold && accel_x < -9.8 + Threshold && accel_x > -9.8 - Threshold && last_cmd != '0'){ //FWD
 			UART_Send("AT+CIPSEND=1\r\n");
 			DELAY_Ms(100);
 			UART_Send("1");
 			UART_Send("\r\n");
 			last_cmd = '1';
+		}
+		else if(0 /*adc_result1 > BENT_Threshold && accel_z < -9.8 + Threshold && accel_z > -9.8 - Threshold && last_cmd != '2'*/){//Unused
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("2");
+			UART_Send("\r\n");
+			last_cmd = '2';
+		}
+		else if(adc_result1 > BENT_Threshold && accel_z < -9.8 + Threshold && accel_z > -9.8 - Threshold && last_cmd != '3'){ //Right
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("3");
+			UART_Send("\r\n");
+			last_cmd = '3';
+		}
+		else if(adc_result1 > BENT_Threshold && accel_z < 9.8 + Threshold && accel_z > 9.8 - Threshold && last_cmd != '4'){ //Left
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("4");
+			UART_Send("\r\n");
+			last_cmd = '4';
+		}
+		else if(adc_result1 < BENT_Threshold && accel_z < -9.8 + Threshold && accel_z > -9.8 - Threshold && last_cmd != '5'){//FWD Right
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("5");
+			UART_Send("\r\n");
+			last_cmd = '5';
+		}
+		else if(adc_result1 > BENT_Threshold && accel_z < 9.8 + Threshold && accel_z > 9.8 - Threshold && last_cmd != '6'){//FWD Left
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("6");
+			UART_Send("\r\n");
+			last_cmd = '6';
+		}
+		else if(adc_result1 < BENT_Threshold && last_cmd != '7'){//Unused
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("7");
+			UART_Send("\r\n");
+			last_cmd = '7';
+		}
+		else if(adc_result1 < BENT_Threshold && last_cmd != '8'){//unused
+			UART_Send("AT+CIPSEND=1\r\n");
+			DELAY_Ms(100);
+			UART_Send("8");
+			UART_Send("\r\n");
+			last_cmd = '8';
 		}
 		/*if(accel_x < -9.8 + Threshold && accel_x > -9.8 - Threshold){//Right turn
 			
