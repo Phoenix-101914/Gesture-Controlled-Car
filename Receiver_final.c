@@ -1,0 +1,399 @@
+#include "stm32f4xx.h"
+#include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal_rcc.h"
+#include "stm32f4xx_hal_gpio.h"
+
+#define ULTRASONIC_PORT GPIOD
+#define SPD_MAX    2500  // 100% Speed
+#define SPD_TURN   1800  // 70% (For Spin)
+#define SPD_CURVE  1200  // 50% (For Inner Wheel on Curves)
+
+uint16_t count;
+static __IO uint32_t usTick;
+volatile float leftDist,rightDist,frontDist,backDist;
+uint16_t leftTime,rightTime,frontTime,backTime;
+volatile int setup_done = 0;
+uint8_t cmd = 255; // Default to invalid
+uint8_t collision = 0;
+
+void SystemClock_Config(void);
+void USART_Config(void);
+void PWM_Config(void); 
+void USART_SendString(char* str);
+void Set_Motor_State(int left_speed, int right_speed);
+void DELAY_Init(void);
+void DELAY_Us(uint32_t us);
+void DELAY_Ms(uint32_t ms);
+
+void SystemClock_Config(void){ //Setting Clock HSE - 8MHz After PLL - 168MHz
+	RCC_OscInitTypeDef RCC_OscInitStruct;
+	RCC_ClkInitTypeDef RCC_ClkInitStruct;
+	
+	__HAL_RCC_PWR_CLK_ENABLE();
+	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+	
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+	//RCC_OscInitStruct.LSEState =; Not used
+	//RCC_OscInitStruct.HSIState =; Not used
+	//RCC_OscInitStruct.HSICalibrationValue =; Not used
+	//RCC_OscInitStruct.LSIState =; Not used
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	RCC_OscInitStruct.PLL.PLLM = 8;
+	RCC_OscInitStruct.PLL.PLLN = 336;
+	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+	RCC_OscInitStruct.PLL.PLLQ = 7;
+	
+	HAL_RCC_OscConfig(&RCC_OscInitStruct);
+	
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+	
+	HAL_RCC_ClockConfig(&RCC_ClkInitStruct,FLASH_LATENCY_5);
+}
+
+void DELAY_Init(){
+	// Configure the SysTick timer to raise interript every 1 us
+	SysTick_Config(SystemCoreClock / 1000000);
+}
+
+// SysTick_Handler function will be called every 1 us
+
+void SysTick_Handler(){
+	if (usTick != 0)
+	{
+		usTick--;
+	}
+	count++;
+}
+
+void DELAY_Us(uint32_t us){
+	// Reload us value
+	usTick = us;
+	// Wait until usTick reach zero
+	while (usTick);
+}
+
+void DELAY_Ms(uint32_t ms){
+	// Wait until ms reach zero
+	while (ms--){
+		// Delay 1ms
+		DELAY_Us(1000);
+	}
+}
+
+void GPIO_Init(void){//Configuring GPIO and I2C
+	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIODEN | RCC_AHB1ENR_GPIOEEN;
+	GPIOD->MODER &= ~(0xFF000000); GPIOD->MODER |= (0x55000000); // Direction Pins (PD12-15) -> Output
+
+	GPIOE->MODER &= ~( (3<<(9*2)) | (3<<(11*2)) );// Speed Pins (PE9, PE11) -> AF1
+	GPIOE->MODER |=  ( (2<<(9*2)) | (2<<(11*2)) );
+	GPIOE->AFR[1] |= (1 << 4);  // PE9
+	GPIOE->AFR[1] |= (1 << 12); // PE11
+	
+	GPIOA->MODER &= ~((3 << 4) | (3 << 6)); // UART (PA2, PA3) -> AF7
+	GPIOA->MODER |=  ((2 << 4) | (2 << 6)); 
+	GPIOA->AFR[0] |= (0x7 << 8) | (0x7 << 12);
+	
+	__HAL_RCC_GPIOD_CLK_ENABLE();
+	GPIO_InitTypeDef GPIO_InitStruct;
+	
+	GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3; //Trig pins 0-Front 1-Right 2-Left 3-Back
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(ULTRASONIC_PORT, &GPIO_InitStruct);
+	
+	GPIO_InitStruct.Pin = GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7; //Echo pins 4-Front 5-Right 6-Left 7-Back
+	GPIO_InitStruct.Pull = GPIO_NOPULL;
+	GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+	GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(ULTRASONIC_PORT, &GPIO_InitStruct);
+}
+
+void UltrasonicRead(void){
+	// Reading Front
+	ULTRASONIC_PORT->BSRR = 1<<16;//Trig LOW
+	DELAY_Us(2);
+	ULTRASONIC_PORT->BSRR = 1<<0;//Trig HIGH for Front
+	DELAY_Us(10);
+	ULTRASONIC_PORT->BSRR = 1<<16;//Trig LOW
+	
+	uint16_t localCount = 0;
+	uint8_t state = 0;
+	while(localCount < 10000 && frontTime == 0){
+		if((ULTRASONIC_PORT->IDR & 0x0010) == 0x0010 && state == 0){
+			state++;
+		}
+		if((ULTRASONIC_PORT->IDR & 0x0010) == 0x0000 && state == 1){
+			frontTime = localCount;
+			state--;
+			break;
+		}
+		localCount++;
+		DELAY_Us(1);
+	}
+	__disable_irq();
+	frontDist = (float)frontTime * 0.017f;
+	__enable_irq();
+	frontTime = 0;
+	
+	// Reading Right
+	ULTRASONIC_PORT->BSRR = 1<<17;//Trig LOW
+	DELAY_Us(2);
+	ULTRASONIC_PORT->BSRR = 1<<1;//Trig HIGH for Right
+	DELAY_Us(10);
+	ULTRASONIC_PORT->BSRR = 1<<17;//Trig LOW
+	
+	localCount = 0;
+	state = 0;
+	while(localCount < 10000 && rightTime == 0){
+		if((ULTRASONIC_PORT->IDR & 0x0020) == 0x0020 && state == 0){
+			state++;
+		}
+		if((ULTRASONIC_PORT->IDR & 0x0020) == 0x0000 && state == 1){
+			rightTime = localCount;
+			state--;
+			break;
+		}
+		localCount++;
+		DELAY_Us(1);
+	}
+	__disable_irq();
+	rightDist = (float)rightTime * 0.017f;
+	__enable_irq();
+	rightTime = 0;
+	
+	// Reading left
+	ULTRASONIC_PORT->BSRR = 1<<18;//Trig LOW
+	DELAY_Us(2);
+	ULTRASONIC_PORT->BSRR = 1<<2;//Trig HIGH for left
+	DELAY_Us(10);
+	ULTRASONIC_PORT->BSRR = 1<<18;//Trig LOW
+	
+	localCount = 0;
+	state = 0;
+	while(localCount < 10000 && leftTime == 0){
+		if((ULTRASONIC_PORT->IDR & 0x0040) == 0x0040 && state == 0){
+			state++;
+		}
+		if((ULTRASONIC_PORT->IDR & 0x0040) == 0x0000 && state == 1){
+			leftTime = localCount;
+			state--;
+			break;
+		}
+		localCount++;
+		DELAY_Us(1);
+	}
+	__disable_irq();
+	leftDist = (float)leftTime * 0.017f;
+	__enable_irq();
+	leftTime = 0;
+	
+	// Reading back
+	ULTRASONIC_PORT->BSRR = 1<<19;//Trig LOW
+	DELAY_Us(2);
+	ULTRASONIC_PORT->BSRR = 1<<3;//Trig HIGH for back
+	DELAY_Us(10);
+	ULTRASONIC_PORT->BSRR = 1<<19;//Trig LOW
+	
+	localCount = 0;
+	state = 0;
+	while(localCount < 10000 && backTime == 0){
+		if((ULTRASONIC_PORT->IDR & 0x0080) == 0x0080 && state == 0){
+			state++;
+		}
+		if((ULTRASONIC_PORT->IDR & 0x0080) == 0x0000 && state == 1){
+			backTime = localCount;
+			state--;
+			break;
+		}
+		localCount++;
+		DELAY_Us(1);
+	}
+	__disable_irq();
+	backDist = (float)backTime * 0.017f;
+	__enable_irq();
+	backTime = 0;
+}
+
+void USART2_IRQHandler(void){
+	if (USART2->SR & USART_SR_RXNE){
+		char c = USART2->DR;
+		if (setup_done == 0) return;
+		
+		cmd = 255; // Default to invalid
+		if (c >= '0' && c <= '8'){
+			cmd = c - '0';
+		}
+		else if (c <= 8) {
+			cmd = c;
+		}
+	}
+}
+void Set_Motor_State(int left_speed, int right_speed){
+    // LEFT MOTOR (PD12/13 + PE9)
+	if (left_speed > 0) {
+		GPIOD->BSRR = (1 << (12+16)) | (1 << 13);
+		TIM1->CCR1 = left_speed;      
+	}
+	else if (left_speed < 0) {
+		GPIOD->BSRR = (1 << 12) | (1 << (13+16));     
+		TIM1->CCR1 = -left_speed;     
+	} 
+	else {
+		GPIOD->BSRR = (1 << (12+16)) | (1 << (13+16)); // Stop
+		TIM1->CCR1 = 0;
+	}
+// RIGHT MOTOR (PD14/15 + PE11)
+	if (right_speed > 0) {
+		GPIOD->BSRR = (1 << (14+16)) | (1 << 15);
+		TIM1->CCR2 = right_speed;     
+	} 
+	else if (right_speed < 0) {
+		GPIOD->BSRR = (1 << 14) | (1 << (15+16));
+		TIM1->CCR2 = -right_speed;
+	}
+	else {
+		GPIOD->BSRR = (1 << (14+16)) | (1 << (15+16)); // Stop
+		TIM1->CCR2 = 0;
+	}
+}
+
+void PWM_Config(void){
+    // Enable TIM1 (APB2) for PE9/PE11
+	TIM1->CCR1 = 0; 
+	TIM1->CCR2 = 0;
+	RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+	TIM1->PSC = 167; 
+	TIM1->ARR = 2499; 
+	TIM1->CCMR1 |= (6 << 4) | (1 << 3) | (6 << 12) | (1 << 11);
+	TIM1->CCER |= TIM_CCER_CC1E | TIM_CCER_CC2E;
+	TIM1->BDTR |= TIM_BDTR_MOE;
+	TIM1->CR1 |= TIM_CR1_CEN;
+}
+
+void USART_Config(void) {
+	RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+	USART2->BRR = 0x16D; 
+	USART2->CR1 |= USART_CR1_UE | USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
+	NVIC_EnableIRQ(USART2_IRQn);
+}
+
+void USART_SendString(char* str) {
+	while (*str) {
+		while (!(USART2->SR & USART_SR_TXE)); 
+		USART2->DR = *str++;
+	}
+}
+
+void AvoidCollisions(){
+	if(cmd == 1 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 2 && backDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 3 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 4 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 5 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 6 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 7 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	if(cmd == 8 && frontDist < 20){
+		collision = 1;
+		return;
+	}
+	else{
+		collision = 0;
+	}
+}
+
+int main(void){
+	int i;
+	SystemClock_Config();
+	DELAY_Init();
+	GPIO_Init();
+	PWM_Config();
+	USART_Config();
+	USART_SendString("AT+RST\r\n");
+	DELAY_Ms(3000);
+	
+	USART_SendString("AT+CWMODE=2\r\n");
+	DELAY_Ms(1000);
+	
+	USART_SendString("AT+CWSAP=\"RCCarNet\",\"12345678\",5,3\r\n");
+	DELAY_Ms(1000);
+	
+	USART_SendString("AT+CIPMUX=1\r\n");
+	DELAY_Ms(1000);
+	
+	for(i = 0; i < 3; i++) {
+		USART_SendString("AT+CIPSERVER=1,8080\r\n");
+		DELAY_Ms(1000); 
+	}
+	
+	setup_done = 1;
+	GPIOD->BSRR = (1 << 13);
+	while(1){
+		UltrasonicRead();
+		AvoidCollisions();
+		if(collision == 1){
+			Set_Motor_State(0,0);
+		}
+		else if (cmd <= 8) {
+			if(cmd == 0){
+				Set_Motor_State(0, 0);
+			}
+			else if(cmd == 1){
+					Set_Motor_State(SPD_MAX, SPD_MAX);
+			}
+			else if(cmd == 2){
+				Set_Motor_State(-SPD_MAX, -SPD_MAX);
+			}
+			else if(cmd == 3){
+				Set_Motor_State(-SPD_TURN, SPD_TURN);
+			}
+			else if(cmd == 4){
+				Set_Motor_State(SPD_TURN, -SPD_TURN);
+			}
+			else if(cmd == 5){
+				Set_Motor_State(SPD_MAX, SPD_CURVE);
+			}
+			else if(cmd == 6){
+				Set_Motor_State(SPD_CURVE, SPD_MAX);
+			}
+			else if(cmd == 7){
+				Set_Motor_State(-SPD_CURVE, -SPD_MAX);
+			}
+			else if(cmd == 8){
+				Set_Motor_State(-SPD_MAX, -SPD_CURVE);
+			}
+			else{
+				Set_Motor_State(0, 0);
+				cmd = 0;
+			}
+		}
+		DELAY_Ms(10);
+	}
+}
